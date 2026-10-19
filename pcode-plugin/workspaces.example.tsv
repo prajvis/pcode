@@ -1,0 +1,5 @@
+# alias<TAB>workspace<TAB>repo<TAB>ai_cli
+proj	my-project	/home/coder/my-project	cursor
+app	customer-app	/home/coder/customer-app	claude
+api	customer-api	/home/coder/customer-api	codex
+infra	infra-config	/home/coder/infra-config	cursor

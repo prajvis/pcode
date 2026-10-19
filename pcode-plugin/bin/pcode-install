@@ -1,0 +1,152 @@
+#!/bin/sh
+# Download the pcode release binary into this plugin's bin/ (or --dir).
+set -eu
+
+err() {
+	printf 'pcode-install: %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'HELP'
+Usage:
+  pcode-install [--dir DIR] [--force]
+  pcode-install --version
+  pcode-install --help
+
+Installs the pcode binary for this plugin version into DIR (default:
+the directory that contains this script). Override DIR with --dir or
+PCODE_INSTALL_DIR. --force replaces an existing binary.
+HELP
+}
+
+download() {
+	dl_url=$1
+	dl_out=$2
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL -o "$dl_out" "$dl_url" || err "download failed: $dl_url"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$dl_out" "$dl_url" || err "download failed: $dl_url"
+	else
+		err "neither curl nor wget found"
+	fi
+}
+
+file_sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
+	else
+		err "neither sha256sum nor shasum found"
+	fi
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+plugin_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+
+force=0
+print_version=0
+dir=${PCODE_INSTALL_DIR:-}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--dir)
+		[ $# -ge 2 ] || err "--dir needs a directory"
+		dir=$2
+		shift 2
+		;;
+	--force)
+		force=1
+		shift
+		;;
+	--version)
+		print_version=1
+		shift
+		;;
+	-h|--help)
+		usage
+		exit 0
+		;;
+	*)
+		err "unknown arg: $1"
+		;;
+	esac
+done
+
+if [ -f "$plugin_root/VERSION" ]; then
+	version=$(tr -d ' \t\r\n' < "$plugin_root/VERSION")
+elif [ -f "$plugin_root/plugin.json" ]; then
+	version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$plugin_root/plugin.json" | head -n 1)
+else
+	err "could not read version from VERSION or plugin.json"
+fi
+[ -n "$version" ] || err "empty version in VERSION or plugin.json"
+version=${version#v}
+
+if [ "$print_version" = 1 ]; then
+	printf '%s\n' "$version"
+	exit 0
+fi
+
+if [ -z "$dir" ]; then
+	dir=$script_dir
+fi
+
+dest="$dir/pcode"
+if [ "$force" != 1 ] && [ -x "$dest" ]; then
+	got=$("$dest" --version 2>/dev/null || true)
+	if [ "$got" = "pcode $version" ]; then
+		printf 'pcode %s already installed at %s\n' "$version" "$dest"
+		exit 0
+	fi
+fi
+
+if [ ! -d "$dir" ]; then
+	mkdir -p "$dir" || err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
+fi
+if [ ! -w "$dir" ]; then
+	err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
+fi
+
+os=$(uname -s | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+arch=$(uname -m)
+case "$os" in
+linux|darwin) ;;
+*) err "unsupported platform: $os/$arch" ;;
+esac
+case "$arch" in
+x86_64|amd64) arch=amd64 ;;
+aarch64|arm64) arch=arm64 ;;
+*) err "unsupported platform: $os/$arch" ;;
+esac
+
+asset="pcode_${version}_${os}_${arch}.tar.gz"
+base=${PCODE_DOWNLOAD_BASE:-https://github.com/prajvis/pcode/releases/download/v${version}}
+base=${base%/}
+
+work=$(mktemp -d) || err "could not create temp dir"
+trap 'rm -rf "$work"' EXIT
+tarball="$work/$asset"
+sums="$work/SHA256SUMS.txt"
+
+download "$base/$asset" "$tarball"
+download "$base/SHA256SUMS.txt" "$sums"
+
+expected=$(awk -v n="$asset" '$2 == n || $2 == "*"n { print $1; exit }' "$sums")
+[ -n "$expected" ] || err "no checksum for $asset in SHA256SUMS.txt"
+actual=$(file_sha256 "$tarball")
+[ "$actual" = "$expected" ] || err "checksum mismatch for $asset"
+
+extract="$work/extract"
+mkdir -p "$extract"
+tar -xzf "$tarball" -C "$extract" || err "failed to extract $asset"
+src="$extract/pcode"
+[ -f "$src" ] || err "archive did not contain pcode"
+
+tmp="$dir/pcode.new.$$"
+cp "$src" "$tmp" || err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
+chmod +x "$tmp"
+mv "$tmp" "$dest" || err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
+
+printf 'installed pcode %s to %s\n' "$version" "$dest"

@@ -1,0 +1,9 @@
+{
+  "name": "pcode",
+  "version": "0.1.0",
+  "description": "Do coding, git, and AI work in Coder remote workspaces instead of the local sandbox.",
+  "author": {
+    "name": "Prajvis"
+  },
+  "skills": "./skills/"
+}

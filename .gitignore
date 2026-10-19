@@ -1,0 +1,4 @@
+# Built binaries and packaging output
+pcode/bin/
+pcode-plugin/bin/pcode
+dist/

@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pcode/go.mod
+          cache-dependency-path: pcode/go.sum
+      - name: Build release archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          for spec in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64"; do
+            goos="${spec%% *}"
+            goarch="${spec##* }"
+            name="pcode_${VERSION}_${goos}_${goarch}"
+            outdir="dist/${name}"
+            mkdir -p "${outdir}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go -C pcode build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "$(pwd)/${outdir}/pcode" ./cmd/pcode
+            cp LICENSE NOTICE "${outdir}/"
+            cp -R THIRD_PARTY_LICENSES "${outdir}/"
+            tar -C "${outdir}" -czf "dist/${name}.tar.gz" pcode LICENSE NOTICE THIRD_PARTY_LICENSES
+            rm -rf "${outdir}"
+          done
+          (cd dist && sha256sum pcode_${VERSION}_*.tar.gz > SHA256SUMS.txt)
+          ls -l dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS.txt --title "pcode $VERSION" --generate-notes
+          fi

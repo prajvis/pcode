@@ -1,0 +1,8 @@
+pcode, Copyright 2026 Prajvis
+
+pcode links github.com/coder/coder/v2 (codersdk, workspacesdk), which is
+licensed AGPL-3.0, so prebuilt pcode binaries are distributed under the
+terms of the GNU AGPL v3, and the complete corresponding source is this
+repository.
+
+https://github.com/coder/coder
