@@ -52,8 +52,14 @@ pcode create --show-template <name>
 pcode create --alias … --workspace … --template … --parameter 'Name=value'
 pcode <alias> exec '<cmd>'
 pcode <alias> ai <chat-name> '<prompt>'
+pcode <alias> stop <chat-name>
 pcode <alias> verify
 ```
+
+Exit codes: 0 completed, 1 pcode/usage/connection error, 2 agent error,
+3 incomplete (no result event), 4 idle timeout, 130 cancelled (signal).
+`pcode <alias> stop <chat-name>` stops a remote ai run. Cancelling the
+local process (SIGINT/SIGTERM/SIGHUP) also stops the remote agent.
 
 Registry path resolution is documented in the top-level README and in
 `pcode --help`.

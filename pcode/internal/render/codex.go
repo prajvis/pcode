@@ -17,10 +17,22 @@ type CodexResult struct {
 	Err       error
 }
 
+type CodexDecoder struct {
+	OnComplete func()
+}
+
 func Codex(r io.Reader, w io.Writer) CodexResult {
+	return new(CodexDecoder).Render(r, w)
+}
+
+func (d *CodexDecoder) Render(r io.Reader, w io.Writer) CodexResult {
+	if d == nil {
+		d = new(CodexDecoder)
+	}
 	res := CodexResult{}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	gotComplete := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -46,9 +58,14 @@ func Codex(r io.Reader, w io.Writer) CodexResult {
 				}
 			}
 		case "turn.completed":
+			gotComplete = true
 			if !res.Completed {
 				fmt.Fprintln(w, "codex agent completed")
 				res.Completed = true
+			}
+			res.Err = nil
+			if d.OnComplete != nil {
+				d.OnComplete()
 			}
 		case "error":
 			msg := str(event["message"])
@@ -56,10 +73,12 @@ func Codex(r io.Reader, w io.Writer) CodexResult {
 				msg = line
 			}
 			fmt.Fprintf(w, "error: %s\n", msg)
-			res.Err = fmt.Errorf("%s", msg)
+			if !res.Completed {
+				res.Err = fmt.Errorf("%s", msg)
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil && res.Err == nil {
+	if err := scanner.Err(); err != nil && res.Err == nil && !gotComplete {
 		res.Err = err
 	}
 	if res.Started && !res.Completed {

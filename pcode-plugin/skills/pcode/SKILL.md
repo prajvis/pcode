@@ -57,6 +57,20 @@ If you are unsure about a flag, run `pcode --help`. Do not call help on every
 turn. Do not invent wrappers. Do not `coder ssh`. If `pcode` fails, stop and
 report it.
 
+## Stop a run
+
+Cancelling the local `pcode <alias> ai` job (Ctrl-C, SIGTERM, SIGHUP, or
+the client aborting) now stops the remote agent too.
+
+To stop a run explicitly:
+
+```bash
+pcode web stop review
+```
+
+If nothing is running, it says so and exits 0. A second `ai` on the same
+alias and chat title is refused while a run is still alive; stop it first.
+
 ## Register or create
 
 Existing workspace:

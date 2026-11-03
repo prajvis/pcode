@@ -56,9 +56,18 @@ pcode add --alias web --workspace my-website --repo /home/coder/website
 pcode list
 pcode web exec 'pwd && git status -sb'
 pcode web ai feature "implement the change; run tests; do not push"
+pcode web stop feature
 pcode web verify
 pcode remove web
 ```
+
+`stop` kills a remote ai run for that alias and chat name. Cancelling
+the local `pcode` process (Ctrl-C, SIGTERM, SIGHUP) also stops the
+remote agent. A second `ai` on the same alias and title is refused
+while a run is still alive.
+
+Exit codes: 0 completed, 1 pcode/usage/connection error, 2 agent error,
+3 incomplete (no result event), 4 idle timeout, 130 cancelled (signal).
 
 `create` provisions a Coder workspace from a template; see
 `pcode create --help`. Confirm with the user before `remove`. `remove`

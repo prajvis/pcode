@@ -18,6 +18,10 @@ func BashQuote(s string) string {
 }
 
 func CopyIdle(ctx context.Context, r io.Reader, w io.Writer, idle time.Duration) error {
+	return CopyIdleBusy(ctx, r, w, idle, nil)
+}
+
+func CopyIdleBusy(ctx context.Context, r io.Reader, w io.Writer, idle time.Duration, busy func() bool) error {
 	if idle <= 0 {
 		_, err := io.Copy(w, r)
 		if errors.Is(err, io.EOF) {
@@ -31,13 +35,21 @@ func CopyIdle(ctx context.Context, r io.Reader, w io.Writer, idle time.Duration)
 		err  error
 	}
 	ch := make(chan chunk)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := r.Read(buf)
 			data := append([]byte(nil), buf[:n]...)
-			ch <- chunk{data, err}
-			if err != nil {
+			select {
+			case ch <- chunk{data, err}:
+				if err != nil {
+					return
+				}
+			case <-done:
+				return
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -50,6 +62,10 @@ func CopyIdle(ctx context.Context, r io.Reader, w io.Writer, idle time.Duration)
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
+			if busy != nil && busy() {
+				timer.Reset(idle)
+				continue
+			}
 			return fmt.Errorf("%w after %s", ErrIdleTimeout, idle)
 		case c := <-ch:
 			if len(c.data) > 0 {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 )
 
 type CursorResult struct {
@@ -17,13 +18,46 @@ type CursorResult struct {
 	Err       error
 }
 
+// CursorDecoder renders a cursor agent stream and tracks in-flight tool calls.
+type CursorDecoder struct {
+	mu       sync.Mutex
+	inflight int
+	OnResult func()
+}
+
+func (d *CursorDecoder) Busy() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.inflight > 0
+}
+
+func (d *CursorDecoder) addInflight(delta int) {
+	d.mu.Lock()
+	d.inflight += delta
+	if d.inflight < 0 {
+		d.inflight = 0
+	}
+	d.mu.Unlock()
+}
+
 func Cursor(r io.Reader, w io.Writer) CursorResult {
+	return new(CursorDecoder).Render(r, w)
+}
+
+func (d *CursorDecoder) Render(r io.Reader, w io.Writer) CursorResult {
+	if d == nil {
+		d = new(CursorDecoder)
+	}
 	res := CursorResult{}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	printedTools := map[string]bool{}
 	var lastAssistant string
 	lastEvent := ""
+	gotResult := false
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -54,15 +88,16 @@ func Cursor(r io.Reader, w io.Writer) CursorResult {
 			}
 		case in(etype, "tool_call", "tool_use", "tool", "function_call"):
 			if in(subtype, "completed", "done") {
+				d.addInflight(-1)
 				if failure := toolFailure(event); failure != "" {
-					fmt.Fprintf(w, "error: %s\n", failure)
-					res.Err = fmt.Errorf("%s", failure)
+					fmt.Fprintf(w, "tool failed: %s\n", failure)
 				}
 				continue
 			}
 			if subtype != "" && !in(subtype, "started", "start") {
 				continue
 			}
+			d.addInflight(1)
 			label := toolLabel(event)
 			if !printedTools[label] {
 				fmt.Fprintf(w, "tool: %s\n", label)
@@ -74,13 +109,18 @@ func Cursor(r io.Reader, w io.Writer) CursorResult {
 				msg = line
 			}
 			fmt.Fprintf(w, "error: %s\n", msg)
-			res.Err = fmt.Errorf("%s", msg)
 		case in(etype, "result", "final", "done", "completed", "completion"):
+			gotResult = true
 			if boolish(event["is_error"]) || in(subtype, "error", "failed", "failure", "cancelled", "canceled", "aborted") {
-				res.Err = fmt.Errorf("cursor agent error")
+				res.Err = ErrAgent
+			} else {
+				res.Err = nil
 			}
 			text := extractText(pick(event, "result", "text", "content", "message"))
 			printFinal(w, &res, text)
+			if d.OnResult != nil {
+				d.OnResult()
+			}
 		case in(etype, "cancelled", "canceled", "aborted") || in(subtype, "cancelled", "canceled", "aborted"):
 			msg := extractText(pick(event, "message", "error", "result"))
 			if msg == "" {
@@ -93,14 +133,16 @@ func Cursor(r io.Reader, w io.Writer) CursorResult {
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil && res.Err == nil {
+	if err := scanner.Err(); err != nil && res.Err == nil && !gotResult {
 		res.Err = err
 	}
-	if res.Started && !res.Completed {
-		printIncomplete(w, &res, lastAssistant, "stream ended after "+or(lastEvent, "unknown event"))
-	}
-	if !res.Started && !res.Completed {
-		printIncomplete(w, &res, "", "no stream events received from cursor agent")
+	if !gotResult {
+		if res.Started && !res.Completed {
+			printIncomplete(w, &res, lastAssistant, "stream ended after "+or(lastEvent, "unknown event"))
+		}
+		if !res.Started && !res.Completed {
+			printIncomplete(w, &res, "", "no stream events received from cursor agent")
+		}
 	}
 	return res
 }
@@ -128,7 +170,7 @@ func printIncomplete(w io.Writer, res *CursorResult, last, reason string) {
 		res.Completed = true
 	}
 	if res.Err == nil {
-		res.Err = fmt.Errorf("cursor agent incomplete: %s", reason)
+		res.Err = fmt.Errorf("%w: %s", ErrIncomplete, reason)
 	}
 }
 
@@ -241,7 +283,7 @@ func toolFailure(event map[string]any) string {
 			if msg == "" {
 				msg = str(failure["interleavedOutput"])
 			}
-			return strings.TrimSuffix(key, "ToolCall") + " failed: " + strings.TrimSpace(msg)
+			return strings.TrimSuffix(key, "ToolCall") + ": " + strings.TrimSpace(msg)
 		}
 	}
 	return ""

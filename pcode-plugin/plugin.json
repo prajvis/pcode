@@ -1,6 +1,6 @@
 {
   "name": "pcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Do coding, git, and AI work in Coder remote workspaces instead of the local sandbox.",
   "author": {
     "name": "Prajvis"
