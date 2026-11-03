@@ -23,6 +23,7 @@ const (
 	KindThreads         Kind = "threads"
 	KindLogs            Kind = "logs"
 	KindVerify          Kind = "verify"
+	KindStop            Kind = "stop"
 	KindCreate          Kind = "create"
 	KindCreateHelp      Kind = "create-help"
 	KindCreateTemplates Kind = "create-templates"
@@ -85,7 +86,7 @@ func Parse(args []string) (Request, error) {
 	}
 	alias := args[0]
 	if !config.ValidAlias(alias) {
-		return Request{}, fmt.Errorf("invalid alias %q; expected pcode <alias> <exec|ai|shell|threads|logs|verify>", alias)
+		return Request{}, fmt.Errorf("invalid alias %q; expected pcode <alias> <exec|ai|shell|threads|logs|verify|stop>", alias)
 	}
 	if len(args) == 1 || hasHelp(args[1:]) {
 		return Request{Kind: KindHelp, Alias: alias}, nil
@@ -114,8 +115,13 @@ func Parse(args []string) (Request, error) {
 		return Request{Kind: KindLogs, Alias: alias}, nil
 	case "verify":
 		return Request{Kind: KindVerify, Alias: alias}, nil
+	case "stop":
+		if len(args) < 3 {
+			return Request{}, fmt.Errorf("usage: pcode %s stop <chat-title>", alias)
+		}
+		return Request{Kind: KindStop, Alias: alias, Title: args[2]}, nil
 	default:
-		return Request{}, fmt.Errorf("unknown command %q; use exec, ai, shell, threads, logs, or verify", args[1])
+		return Request{}, fmt.Errorf("unknown command %q; use exec, ai, shell, threads, logs, verify, or stop", args[1])
 	}
 }
 

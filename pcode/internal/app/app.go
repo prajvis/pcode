@@ -5,10 +5,13 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/prajvis/pcode/pcode/internal/config"
 	"github.com/prajvis/pcode/pcode/internal/execx"
@@ -83,6 +86,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return a.logs(ctx, req)
 	case parse.KindVerify:
 		return a.verify(ctx, req)
+	case parse.KindStop:
+		return a.stop(ctx, req)
 	default:
 		return fmt.Errorf("unhandled command")
 	}
@@ -107,6 +112,7 @@ USAGE
   pcode <alias> verify
   pcode <alias> logs
   pcode <alias> shell
+  pcode <alias> stop <chat-title>
 
 COMMANDS
   list      Print registered aliases (alias, Coder workspace, repo, ai cli).
@@ -129,6 +135,18 @@ COMMANDS
   verify    Start the workspace if needed, then pwd + git status in the repo.
   logs      Print the latest Coder build logs for the workspace.
   shell     Interactive SSH session into the workspace.
+  stop      Stop a running ai job for this alias and chat title.
+            Sends SIGTERM to the remote process group, then SIGKILL.
+            If nothing is running, says so and exits 0.
+            Cancelling the local pcode process also stops the remote agent.
+
+EXIT CODES
+  0   completed
+  1   pcode/usage/connection error
+  2   agent reported an error
+  3   incomplete (stream ended without a result)
+  4   idle timeout
+  130 cancelled (signal)
 
 REGISTRY
   TSV file, resolved in this order:
@@ -150,6 +168,7 @@ EXAMPLES
   pcode web exec 'pwd && git status -sb'
   pcode web ai review "summarize the latest diff"
   pcode web ai review "now fix the comments you just found"
+  pcode web stop review
 `
 }
 
@@ -282,6 +301,10 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 		fmt.Fprintf(a.err(), "resuming chat %s (%s)\n", title, resume)
 	}
 
+	if err := a.refuseIfRunning(ctx, sess, rec.Alias, title); err != nil {
+		return err
+	}
+
 	switch cli {
 	case "cursor":
 		if resume == "" {
@@ -300,12 +323,12 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 			}
 		}
 		fmt.Fprintf(a.err(), "sending prompt…\n")
-		if err := a.runCursor(ctx, sess, rec, req.Prompt, resume); err != nil {
+		if err := a.runCursor(ctx, sess, rec, req.Prompt, resume, title); err != nil {
 			return err
 		}
 		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, resume)
 	case "codex":
-		threadID, err := a.runCodex(ctx, sess, rec, req.Prompt, resume)
+		threadID, err := a.runCodex(ctx, sess, rec, req.Prompt, resume, title)
 		if err != nil {
 			return err
 		}
@@ -318,13 +341,13 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, threadID)
 	case "claude":
 		cmd := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.ClaudeCommand + " " + execx.BashQuote(req.Prompt)
-		return sess.Run(ctx, cmd, a.out(), a.err())
+		return a.runPlain(ctx, sess, rec.Alias, title, cmd)
 	default:
 		return fmt.Errorf("unsupported ai cli %q (cursor, codex, claude)", cli)
 	}
 }
 
-func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume string) error {
+func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume, title string) error {
 	flags := "-p"
 	if a.Cfg.CursorStream {
 		flags += " --output-format stream-json --stream-partial-output"
@@ -334,70 +357,224 @@ func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.R
 	if a.Cfg.CursorForce {
 		flags += " --force"
 	}
-	cmd := "cd " + execx.BashQuote(rec.Repo) + " && unset CURSOR_AGENT_OUTPUT_FORMAT CURSOR_OUTPUT_FORMAT && " + a.Cfg.CursorCommand + " " + flags
+	inner := "cd " + execx.BashQuote(rec.Repo) + " && unset CURSOR_AGENT_OUTPUT_FORMAT CURSOR_OUTPUT_FORMAT && " + a.Cfg.CursorCommand + " " + flags
 	if resume != "" {
-		cmd += " --resume " + execx.BashQuote(resume)
+		inner += " --resume " + execx.BashQuote(resume)
 	}
-	cmd += " " + execx.BashQuote(prompt)
+	inner += " " + execx.BashQuote(prompt)
+	cmd := execx.WrapScript(rec.Alias, title, inner)
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		err := sess.Run(ctx, cmd, pw, a.err())
+		err := sess.RunWithStdin(runCtx, cmd, stdinR, pw, a.err())
 		_ = pw.CloseWithError(err)
 		errCh <- err
 	}()
 
+	dec := &render.CursorDecoder{}
 	var rendered bytes.Buffer
-	src := pr
+	src := io.Reader(pr)
+	copyErrCh := make(chan error, 1)
 	if a.Cfg.IdleTimeout > 0 {
 		ipr, ipw := io.Pipe()
 		go func() {
-			err := execx.CopyIdle(ctx, pr, ipw, a.Cfg.IdleTimeout)
+			err := execx.CopyIdleBusy(runCtx, pr, ipw, a.Cfg.IdleTimeout, dec.Busy)
 			_ = ipw.CloseWithError(err)
+			copyErrCh <- err
 		}()
 		src = ipr
+	} else {
+		copyErrCh <- nil
 	}
-	res := render.Cursor(src, io.MultiWriter(a.out(), &rendered))
-	runErr := <-errCh
+	resultCh := make(chan struct{})
+	var resultOnce sync.Once
+	dec.OnResult = func() { resultOnce.Do(func() { close(resultCh) }) }
+	stopGrace := a.startStreamGrace(resultCh, cancel, stdinW, pr, pw)
+	res := dec.Render(src, io.MultiWriter(a.out(), &rendered))
+	stopGrace()
+	copyErr := <-copyErrCh
+
+	idle := errors.Is(copyErr, execx.ErrIdleTimeout)
+	parentCancel := ctx.Err() != nil
+	if idle || parentCancel || res.Err != nil || !res.Completed {
+		cancel()
+		_ = stdinW.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		a.killRemote(sess, rec.Alias, title)
+	}
+	runErr := waitErr(errCh, 8*time.Second)
+	if runErr != nil && strings.Contains(runErr.Error(), "timed out waiting") {
+		cancel()
+		_ = stdinW.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		a.killRemote(sess, rec.Alias, title)
+	}
+	if idle {
+		return fmt.Errorf("%w after %s", execx.ErrIdleTimeout, a.Cfg.IdleTimeout)
+	}
+	if parentCancel {
+		return ctx.Err()
+	}
 	if res.Err != nil {
 		return res.Err
+	}
+	if res.Completed {
+		return nil
 	}
 	if runErr != nil {
 		return runErr
 	}
-	if !res.Started && !res.Completed {
-		return fmt.Errorf("cursor agent incomplete: no stream events received from cursor agent")
-	}
-	return nil
+	return fmt.Errorf("%w: no result event", render.ErrIncomplete)
 }
 
-func (a *App) runCodex(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume string) (string, error) {
+func (a *App) runCodex(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume, title string) (string, error) {
 	flags := "--json"
 	if a.Cfg.CodexForce {
 		flags += " --dangerously-bypass-approvals-and-sandbox"
 	}
-	cmd := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.CodexCommand + " exec " + flags
+	inner := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.CodexCommand + " exec " + flags
 	if resume != "" {
-		cmd += " resume " + execx.BashQuote(resume)
+		inner += " resume " + execx.BashQuote(resume)
 	}
-	cmd += " " + execx.BashQuote(prompt)
+	inner += " " + execx.BashQuote(prompt)
+	cmd := execx.WrapScript(rec.Alias, title, inner)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
-		err := sess.Run(ctx, cmd, pw, a.err())
+		err := sess.RunWithStdin(runCtx, cmd, stdinR, pw, a.err())
 		_ = pw.CloseWithError(err)
 		errCh <- err
 	}()
-	res := render.Codex(pr, a.out())
-	runErr := <-errCh
+	dec := &render.CodexDecoder{}
+	resultCh := make(chan struct{})
+	var resultOnce sync.Once
+	dec.OnComplete = func() { resultOnce.Do(func() { close(resultCh) }) }
+	stopGrace := a.startStreamGrace(resultCh, cancel, stdinW, pr, pw)
+	res := dec.Render(pr, a.out())
+	stopGrace()
+	parentCancel := ctx.Err() != nil
+	if parentCancel || res.Err != nil {
+		cancel()
+		_ = stdinW.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		a.killRemote(sess, rec.Alias, title)
+	}
+	runErr := waitErr(errCh, 8*time.Second)
+	if parentCancel {
+		return res.ThreadID, ctx.Err()
+	}
 	if res.Err != nil {
 		return res.ThreadID, res.Err
+	}
+	if res.Completed {
+		return res.ThreadID, nil
 	}
 	if runErr != nil {
 		return res.ThreadID, runErr
 	}
 	return res.ThreadID, nil
+}
+
+func (a *App) runPlain(ctx context.Context, sess remote.Session, alias, title, inner string) error {
+	cmd := execx.WrapScript(alias, title, inner)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+	err := sess.RunWithStdin(runCtx, cmd, stdinR, a.out(), a.err())
+	if ctx.Err() != nil {
+		cancel()
+		_ = stdinW.Close()
+		a.killRemote(sess, alias, title)
+		return ctx.Err()
+	}
+	return err
+}
+
+func (a *App) stop(ctx context.Context, req parse.Request) error {
+	rec, err := a.Reg.Get(req.Alias)
+	if err != nil {
+		return err
+	}
+	sess, err := a.dial(ctx, rec.Workspace)
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+	return sess.Run(ctx, execx.KillScript(rec.Alias, req.Title), a.out(), a.err())
+}
+
+func (a *App) refuseIfRunning(ctx context.Context, sess remote.Session, alias, title string) error {
+	out, err := sess.Output(ctx, execx.IsRunningScript(alias, title))
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == execx.RunStatusActive {
+			return fmt.Errorf("ai run already in progress; stop it with: pcode %s stop %s", alias, title)
+		}
+	}
+	return nil
+}
+
+func (a *App) killRemote(sess remote.Session, alias, title string) {
+	kctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = sess.Run(kctx, execx.KillScript(alias, title), io.Discard, io.Discard)
+}
+
+func (a *App) startStreamGrace(notify <-chan struct{}, cancel context.CancelFunc, stdinW *io.PipeWriter, pr *io.PipeReader, pw *io.PipeWriter) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-notify:
+		case <-done:
+			return
+		}
+		grace := a.Cfg.StreamGrace
+		if grace <= 0 {
+			grace = 10 * time.Second
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+			_ = stdinW.Close()
+			_ = pr.Close()
+			_ = pw.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+}
+
+func waitErr(ch <-chan error, d time.Duration) error {
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(d):
+		return fmt.Errorf("timed out waiting for remote session to exit")
+	}
 }
 
 func (a *App) dial(ctx context.Context, workspace string) (remote.Session, error) {

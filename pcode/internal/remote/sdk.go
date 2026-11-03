@@ -21,6 +21,7 @@ import (
 
 type Session interface {
 	Run(ctx context.Context, command string, stdout, stderr io.Writer) error
+	RunWithStdin(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error
 	Output(ctx context.Context, command string) (string, error)
 	Shell(ctx context.Context) error
 	Close() error
@@ -217,11 +218,16 @@ func (s *sshSess) Close() error {
 }
 
 func (s *sshSess) Run(ctx context.Context, command string, stdout, stderr io.Writer) error {
+	return s.RunWithStdin(ctx, command, nil, stdout, stderr)
+}
+
+func (s *sshSess) RunWithStdin(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error {
 	sess, err := s.ssh.NewSession()
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
+	sess.Stdin = stdin
 	sess.Stdout = stdout
 	sess.Stderr = stderr
 	wrapped := "bash -lc " + execx.BashQuote(command)

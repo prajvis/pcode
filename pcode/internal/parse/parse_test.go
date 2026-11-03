@@ -141,3 +141,16 @@ func TestParseVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestParseStop(t *testing.T) {
+	req, err := Parse([]string{"website", "stop", "review"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Kind != "stop" || req.Alias != "website" || req.Title != "review" {
+		t.Fatalf("%+v", req)
+	}
+	if _, err := Parse([]string{"website", "stop"}); err == nil {
+		t.Fatal("expected usage error")
+	}
+}

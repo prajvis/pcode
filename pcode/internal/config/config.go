@@ -31,6 +31,7 @@ type Config struct {
 	StartPoll        time.Duration
 	SSHReadyAttempts int
 	IdleTimeout      time.Duration
+	StreamGrace      time.Duration
 	CursorStream     bool
 	CursorForce      bool
 	CodexForce       bool
@@ -68,6 +69,7 @@ func Load() Config {
 		StartPoll:        durationSecs("CODER_WORKSPACE_START_POLL_SECS", 3),
 		SSHReadyAttempts: intEnv("CODER_SSH_READY_ATTEMPTS", 3),
 		IdleTimeout:      durationSecs("CURSOR_AGENT_IDLE_TIMEOUT_SECS", 300),
+		StreamGrace:      durationSecs("CURSOR_AGENT_STREAM_GRACE_SECS", 10),
 		CursorStream:     os.Getenv("CURSOR_AGENT_STREAM") != "0",
 		CursorForce:      os.Getenv("CURSOR_AGENT_FORCE") != "0",
 		CodexForce:       os.Getenv("CODER_AI_CODEX_FORCE") != "0",
