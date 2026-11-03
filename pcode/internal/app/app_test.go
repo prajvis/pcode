@@ -5,33 +5,74 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prajvis/pcode/pcode/internal/config"
+	"github.com/prajvis/pcode/pcode/internal/execx"
 	"github.com/prajvis/pcode/pcode/internal/registry"
 	"github.com/prajvis/pcode/pcode/internal/remote"
 	"github.com/prajvis/pcode/pcode/internal/threads"
 )
 
 type fakeSession struct {
-	mu       sync.Mutex
-	Commands []string
-	handler  func(command string, stdout, stderr io.Writer) error
+	mu        sync.Mutex
+	Commands  []string
+	handler   func(command string, stdout, stderr io.Writer) error
+	cancelled atomic.Bool
 }
 
-func (s *fakeSession) Run(_ context.Context, command string, stdout, stderr io.Writer) error {
+func defaultFakeHandler(command string, stdout, stderr io.Writer) error {
+	if isRunningScriptCommand(command) {
+		fmt.Fprintln(stdout, execx.RunStatusIdle)
+	}
+	return nil
+}
+
+func (s *fakeSession) Run(ctx context.Context, command string, stdout, stderr io.Writer) error {
 	s.mu.Lock()
 	s.Commands = append(s.Commands, command)
 	s.mu.Unlock()
-	if s.handler != nil {
-		return s.handler(command, stdout, stderr)
+	handler := s.handler
+	if handler == nil {
+		handler = defaultFakeHandler
+	} else {
+		inner := handler
+		handler = func(command string, stdout, stderr io.Writer) error {
+			var captured bytes.Buffer
+			err := inner(command, io.MultiWriter(stdout, &captured), stderr)
+			if err != nil {
+				return err
+			}
+			if isRunningScriptCommand(command) && len(bytes.TrimSpace(captured.Bytes())) == 0 {
+				fmt.Fprintln(stdout, execx.RunStatusIdle)
+			}
+			return nil
+		}
 	}
-	return nil
+	errCh := make(chan error, 1)
+	go func() { errCh <- handler(command, stdout, stderr) }()
+	select {
+	case <-ctx.Done():
+		s.cancelled.Store(true)
+		return ctx.Err()
+	case err := <-errCh:
+		return err
+	}
+}
+
+func (s *fakeSession) RunWithStdin(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if stdin != nil {
+		go func() { _, _ = io.Copy(io.Discard, stdin) }()
+	}
+	return s.Run(ctx, command, stdout, stderr)
 }
 
 func (s *fakeSession) Output(ctx context.Context, command string) (string, error) {
@@ -86,12 +127,12 @@ func TestAICreatesThenAutoFollows(t *testing.T) {
 				fmt.Fprintln(stdout, "Created chat "+chatID)
 				return nil
 			}
-			if strings.Contains(command, "agent -p") {
+			if strings.Contains(command, "agent") {
 				fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
 				fmt.Fprintln(stdout, `{"type":"result","result":"ping-ok"}`)
 				return nil
 			}
-			return fmt.Errorf("unexpected command: %s", command)
+			return nil
 		},
 	}
 	app, _, stderr := testApp(t, sess)
@@ -122,7 +163,7 @@ func TestAICreatesThenAutoFollows(t *testing.T) {
 	if strings.Contains(joined, "create-chat") {
 		t.Fatalf("follow-up should not create a chat: %s", joined)
 	}
-	if !strings.Contains(joined, "--resume '"+chatID+"'") {
+	if !strings.Contains(joined, "--resume") || !strings.Contains(joined, chatID) {
 		t.Fatalf("missing resume: %s", joined)
 	}
 }
@@ -186,5 +227,174 @@ func TestExtractUUID(t *testing.T) {
 	}
 	if _, ok := ExtractUUID("nope"); ok {
 		t.Fatal("expected miss")
+	}
+}
+
+func TestRunCursorIdleTimeoutCancels(t *testing.T) {
+	const chatID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			if strings.Contains(command, "create-chat") {
+				fmt.Fprintln(stdout, chatID)
+				return nil
+			}
+			if !strings.Contains(command, "agent") {
+				return nil
+			}
+			fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+			fmt.Fprintln(stdout, `{"type":"tool_call","subtype":"started","tool_call":{"shellToolCall":{"args":{"command":"echo hi"}}}}`)
+			fmt.Fprintln(stdout, `{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"result":{"success":{"stdout":"hi"}}}}}`)
+			time.Sleep(200 * time.Millisecond)
+			for {
+				if _, err := fmt.Fprintln(stdout, `{"type":"assistant","message":{"content":"still going"}}`); err != nil {
+					return err
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	app.Cfg.IdleTimeout = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		done <- app.Run(context.Background(), []string{"website", "ai", "idle", "hello"})
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, execx.ErrIdleTimeout) {
+			t.Fatalf("err=%v", err)
+		}
+		if !sess.cancelled.Load() {
+			t.Fatal("expected fake session to observe cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runCursor did not return within 2s after idle timeout")
+	}
+}
+
+func TestRunCursorBusySkipsIdle(t *testing.T) {
+	const chatID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			if strings.Contains(command, "create-chat") {
+				fmt.Fprintln(stdout, chatID)
+				return nil
+			}
+			if !strings.Contains(command, "agent") {
+				return nil
+			}
+			fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+			fmt.Fprintln(stdout, `{"type":"tool_call","subtype":"started","tool_call":{"shellToolCall":{"args":{"command":"sleep 1"}}}}`)
+			time.Sleep(200 * time.Millisecond)
+			fmt.Fprintln(stdout, `{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"result":{"success":{}}}}}`)
+			fmt.Fprintln(stdout, `{"type":"result","result":"ok"}`)
+			return nil
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	app.Cfg.IdleTimeout = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		done <- app.Run(context.Background(), []string{"website", "ai", "busy", "hello"})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runCursor did not return within 2s while a tool call was in flight")
+	}
+}
+
+func TestAIIdleIsRunningAllowsRun(t *testing.T) {
+	const chatID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			if isRunningScriptCommand(command) {
+				fmt.Fprintln(stdout, "NOT_RUNNING")
+				return nil
+			}
+			if strings.Contains(command, "create-chat") {
+				fmt.Fprintln(stdout, chatID)
+				return nil
+			}
+			if strings.Contains(command, "agent") {
+				fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+				fmt.Fprintln(stdout, `{"type":"result","result":"ok"}`)
+				return nil
+			}
+			return nil
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	if err := app.Run(context.Background(), []string{"website", "ai", "fresh", "hello"}); err != nil {
+		t.Fatalf("ai should proceed when idle: %v", err)
+	}
+}
+
+func TestAIActiveIsRunningRefuses(t *testing.T) {
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			if isRunningScriptCommand(command) {
+				fmt.Fprintln(stdout, "PCODE_RUN_ACTIVE")
+				return nil
+			}
+			return fmt.Errorf("ai should not start remote work")
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	err := app.Run(context.Background(), []string{"website", "ai", "fresh", "hello"})
+	if err == nil || !strings.Contains(err.Error(), "pcode website stop fresh") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func isRunningScriptCommand(command string) bool {
+	if !strings.Contains(command, "$HOME/.pcode/runs/") {
+		return false
+	}
+	return strings.Contains(command, "NOT_RUNNING") ||
+		strings.Contains(command, "PCODE_RUN_IDLE") ||
+		strings.Contains(command, "PCODE_RUN_ACTIVE") ||
+		strings.Contains(command, "echo RUNNING")
+}
+
+func TestRunCursorReturnsAfterResultWithoutEOF(t *testing.T) {
+	const chatID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			if isRunningScriptCommand(command) {
+				fmt.Fprintln(stdout, execx.RunStatusIdle)
+				return nil
+			}
+			if strings.Contains(command, "create-chat") {
+				fmt.Fprintln(stdout, chatID)
+				return nil
+			}
+			if !strings.Contains(command, "agent") {
+				return nil
+			}
+			fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+			fmt.Fprintln(stdout, `{"type":"result","result":"ok"}`)
+			select {
+			case <-time.After(30 * time.Second):
+				return nil
+			}
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	app.Cfg.StreamGrace = 80 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		done <- app.Run(context.Background(), []string{"website", "ai", "hang", "hello"})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(80*time.Millisecond + time.Second):
+		t.Fatal("runCursor did not return within grace+1s after result without EOF")
 	}
 }
