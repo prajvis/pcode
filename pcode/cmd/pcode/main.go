@@ -14,7 +14,7 @@ import (
 )
 
 // version is set by -ldflags "-X main.version=..." at release time.
-var version = "0.1.2"
+var version = "0.1.3"
 
 func main() {
 	cfg := config.Load()

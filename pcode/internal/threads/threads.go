@@ -25,6 +25,26 @@ type Meta struct {
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 	ChatID    string `json:"chat_id,omitempty"`
+	// Threads maps ai cli -> thread id, so one chat title can hold a separate
+	// conversation per backend. ThreadID/AICLI mirror the latest write.
+	Threads map[string]string `json:"threads,omitempty"`
+}
+
+// ThreadFor returns the stored thread id for cli, or "" if this title has no
+// conversation on that backend. Files written before per-cli threads existed
+// only carry ThreadID/AICLI; an empty AICLI there means cursor.
+func (m Meta) ThreadFor(cli string) string {
+	if id := strings.TrimSpace(m.Threads[cli]); id != "" {
+		return id
+	}
+	stored := m.AICLI
+	if stored == "" {
+		stored = "cursor"
+	}
+	if stored == cli {
+		return strings.TrimSpace(m.ThreadID)
+	}
+	return ""
 }
 
 type Store struct {
@@ -69,7 +89,22 @@ func (s *Store) Write(key, purpose, aiCLI, workspace, repo, threadID string) err
 	if created == "" {
 		created = now
 	}
+	threadsByCLI := map[string]string{}
+	if existing.ThreadID != "" {
+		prev := existing.AICLI
+		if prev == "" {
+			prev = "cursor"
+		}
+		threadsByCLI[prev] = existing.ThreadID
+	}
+	for k, v := range existing.Threads {
+		threadsByCLI[k] = v
+	}
+	if threadID != "" {
+		threadsByCLI[aiCLI] = threadID
+	}
 	meta := Meta{
+		Threads:   threadsByCLI,
 		Alias:     key,
 		Purpose:   purpose,
 		AICLI:     aiCLI,
@@ -145,7 +180,22 @@ func FormatList(rows []Meta) string {
 	}
 	var b strings.Builder
 	for _, row := range rows {
-		fmt.Fprintf(&b, "%-16s ai=%s thread=%s updated=%s\n", row.Purpose, row.AICLI, row.ThreadID, row.UpdatedAt)
+		if len(row.Threads) <= 1 {
+			fmt.Fprintf(&b, "%-16s ai=%s thread=%s updated=%s\n", row.Purpose, row.AICLI, row.ThreadID, row.UpdatedAt)
+			continue
+		}
+		clis := make([]string, 0, len(row.Threads))
+		for cli := range row.Threads {
+			clis = append(clis, cli)
+		}
+		sort.Strings(clis)
+		for _, cli := range clis {
+			latest := ""
+			if cli == row.AICLI {
+				latest = " (last used)"
+			}
+			fmt.Fprintf(&b, "%-16s ai=%s thread=%s updated=%s%s\n", row.Purpose, cli, row.Threads[cli], row.UpdatedAt, latest)
+		}
 	}
 	return b.String()
 }

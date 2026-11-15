@@ -52,6 +52,7 @@ pcode create --show-template <name>
 pcode create --alias … --workspace … --template … --parameter 'Name=value'
 pcode <alias> exec '<cmd>'
 pcode <alias> ai <chat-name> '<prompt>'
+pcode <alias> ai --ai-cli pi <chat-name> '<prompt>'   # one-off backend override
 pcode <alias> stop <chat-name>
 pcode <alias> verify
 ```

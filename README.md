@@ -23,7 +23,7 @@ It talks to a Coder deployment you already use. Authentication is
 ### Plugin (Prajvis, Claude Code, Cursor, Codex)
 
 Install the `pcode-plugin/` directory as a plugin, then run
-`pcode-plugin/bin/pcode-install` once. It reads the version from `pcode-plugin/bin/VERSION` and writes the release binary
+`pcode-plugin/bin/pcode-install` once. It downloads the latest GitHub release and writes the release binary
 to `pcode-plugin/bin/pcode`, which is the command on PATH (linux and
 darwin, amd64 and arm64). `bin/pcode` is not stored in git.
 
@@ -127,7 +127,7 @@ snippet.
 pcode/            CLI source
 pcode-plugin/     Claude Code, Cursor, and Codex plugin and skill
   bin/pcode         CLI binary (not in git; run bin/pcode-install)
-  bin/pcode-install downloads the matching release into bin/pcode
+  bin/pcode-install downloads the latest release into bin/pcode
 ```
 
 ## License

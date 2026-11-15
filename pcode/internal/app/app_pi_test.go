@@ -181,3 +181,57 @@ func TestAIIgnoresThreadFromOtherBackend(t *testing.T) {
 		t.Fatalf("meta=%+v err=%v", meta, err)
 	}
 }
+
+// The alias stays cursor; --ai-cli pi runs pi once, and each backend keeps
+// its own conversation under the same chat title.
+func TestAICLIOverridePerCall(t *testing.T) {
+	const cursorChat = "11111111-2222-3333-4444-555555555555"
+	var cursorRuns, piRuns []string
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			switch {
+			case strings.Contains(command, "create-chat"):
+				fmt.Fprintln(stdout, "Created chat "+cursorChat)
+			case strings.Contains(command, "pi --mode json"):
+				piRuns = append(piRuns, command)
+				fmt.Fprintf(stdout, piOKStream, piSessionID(t, command))
+			case strings.Contains(command, "agent -p"):
+				cursorRuns = append(cursorRuns, command)
+				fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+				fmt.Fprintln(stdout, `{"type":"result","result":"ok"}`)
+			}
+			return nil
+		},
+	}
+	app, _, stderr := testApp(t, sess) // alias "website" registered as cursor
+	app.Cfg.PiCommand = "pi"
+	ctx := context.Background()
+	if err := app.Run(ctx, []string{"website", "ai", "fix", "hi"}); err != nil {
+		t.Fatalf("cursor run: %v", err)
+	}
+	if err := app.Run(ctx, []string{"website", "ai", "--ai-cli", "pi", "fix", "hi"}); err != nil {
+		t.Fatalf("pi run: %v", err)
+	}
+	if err := app.Run(ctx, []string{"website", "ai", "--ai-cli=pi", "fix", "again"}); err != nil {
+		t.Fatalf("pi follow-up: %v", err)
+	}
+	if err := app.Run(ctx, []string{"website", "ai", "fix", "back to cursor"}); err != nil {
+		t.Fatalf("cursor follow-up: %v", err)
+	}
+	if len(cursorRuns) != 2 || len(piRuns) != 2 {
+		t.Fatalf("cursor=%d pi=%d", len(cursorRuns), len(piRuns))
+	}
+	if piSessionID(t, piRuns[0]) != piSessionID(t, piRuns[1]) || strings.Contains(piRuns[0], cursorChat) {
+		t.Fatalf("pi session not reused or cursor id leaked: %v", piRuns)
+	}
+	if !strings.Contains(cursorRuns[1], cursorChat) {
+		t.Fatalf("cursor chat not resumed after pi runs: %s", cursorRuns[1])
+	}
+	rec, err := app.Reg.Get("website")
+	if err != nil || rec.AICLI != "cursor" {
+		t.Fatalf("override must not change the alias: %+v %v", rec, err)
+	}
+	if !strings.Contains(stderr.String(), "resuming chat fix (") || !strings.Contains(stderr.String(), ", pi)") {
+		t.Fatalf("stderr: %s", stderr.String())
+	}
+}

@@ -107,7 +107,7 @@ USAGE
   pcode create --help
   pcode version
   pcode <alias> exec <command>
-  pcode <alias> ai <chat-title> <prompt>
+  pcode <alias> ai [--ai-cli <cli>] <chat-title> <prompt>
   pcode <alias> threads
   pcode <alias> verify
   pcode <alias> logs
@@ -131,7 +131,10 @@ COMMANDS
   ai        Send a prompt to the alias AI CLI (cursor agent by default;
             pi runs "pi --mode json --session-id <id>", extra flags such as
             --model come from CODER_AI_PI_ARGS or Pi's own settings).
-            Same alias + same chat-title resumes the stored thread.
+            --ai-cli cursor|codex|claude|pi overrides the alias' cli for this
+            call only; omit it to use the alias default.
+            Same alias + same chat-title (+ same cli) resumes the stored
+            thread; each cli keeps its own conversation under a chat-title.
             A different title starts a new chat. There is no follow command.
   threads   List stored chat titles and thread ids for the alias.
   verify    Start the workspace if needed, then pwd + git status in the repo.
@@ -170,6 +173,7 @@ EXAMPLES
   pcode web exec 'pwd && git status -sb'
   pcode web ai review "summarize the latest diff"
   pcode web ai review "now fix the comments you just found"
+  pcode web ai --ai-cli pi review "second opinion on the same diff"
   pcode web stop review
 `
 }
@@ -296,16 +300,19 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 	defer sess.Close()
 
 	cli := config.NormalizeAICLI(rec.AICLI)
+	if req.AICLI != "" {
+		// One-off override; the alias keeps its registered ai cli.
+		cli = config.NormalizeAICLI(req.AICLI)
+	}
 	title := strings.TrimSpace(req.Title)
 	resume := ""
-	if meta, err := a.Threads.Read(rec.Alias, title); err == nil && strings.TrimSpace(meta.ThreadID) != "" {
-		if stored := config.NormalizeAICLI(meta.AICLI); meta.AICLI != "" && stored != cli {
-			// A thread id from another backend is meaningless here; resuming
-			// it would silently start an empty chat under a foreign id.
-			fmt.Fprintf(a.err(), "chat %s was a %s chat; starting a new %s chat\n", title, stored, cli)
-		} else {
-			resume = meta.ThreadID
-			fmt.Fprintf(a.err(), "resuming chat %s (%s)\n", title, resume)
+	if meta, err := a.Threads.Read(rec.Alias, title); err == nil {
+		// Thread ids are per backend; never hand a cursor chat id to pi etc.
+		if id := meta.ThreadFor(cli); id != "" {
+			resume = id
+			fmt.Fprintf(a.err(), "resuming chat %s (%s, %s)\n", title, resume, cli)
+		} else if strings.TrimSpace(meta.ThreadID) != "" {
+			fmt.Fprintf(a.err(), "chat %s has no %s conversation yet; starting one (other backends keep theirs)\n", title, cli)
 		}
 	}
 

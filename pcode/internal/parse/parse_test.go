@@ -154,3 +154,32 @@ func TestParseStop(t *testing.T) {
 		t.Fatal("expected usage error")
 	}
 }
+
+func TestParseAICLIOverride(t *testing.T) {
+	for _, args := range [][]string{
+		{"web", "ai", "--ai-cli", "pi", "review", "look", "here"},
+		{"web", "ai", "--ai-cli=pi-agent", "review", "look", "here"},
+	} {
+		req, err := Parse(args)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if req.AICLI != "pi" || req.Title != "review" || req.Prompt != "look here" {
+			t.Fatalf("%v: %+v", args, req)
+		}
+	}
+	req, err := Parse([]string{"web", "ai", "review", "--ai-cli", "pi"})
+	if err != nil || req.AICLI != "" || req.Prompt != "--ai-cli pi" {
+		t.Fatalf("flag after the title must stay prompt text: %+v %v", req, err)
+	}
+	for _, bad := range [][]string{
+		{"web", "ai", "--ai-cli"},
+		{"web", "ai", "--ai-cli", "vim", "t", "p"},
+		{"web", "ai", "--ai-cli", "pi", "only-title"},
+		{"web", "ai", "--ai-clix", "t", "p"},
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("expected error for %v", bad)
+		}
+	}
+}

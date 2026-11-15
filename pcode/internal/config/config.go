@@ -124,6 +124,16 @@ func NormalizeAICLI(cli string) string {
 	}
 }
 
+// KnownAICLI reports whether cli (after normalization) is a supported backend.
+func KnownAICLI(cli string) bool {
+	switch NormalizeAICLI(cli) {
+	case "cursor", "codex", "claude", "pi":
+		return true
+	default:
+		return false
+	}
+}
+
 func ThreadBacked(cli string) bool {
 	switch NormalizeAICLI(cli) {
 	case "cursor", "codex", "pi":

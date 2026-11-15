@@ -98,15 +98,7 @@ func Parse(args []string) (Request, error) {
 		}
 		return Request{Kind: KindExec, Alias: alias, Command: strings.Join(args[2:], " ")}, nil
 	case "ai":
-		if len(args) < 4 {
-			return Request{}, fmt.Errorf("usage: pcode %s ai <chat-title> <prompt>", alias)
-		}
-		return Request{
-			Kind:   KindAI,
-			Alias:  alias,
-			Title:  args[2],
-			Prompt: strings.Join(args[3:], " "),
-		}, nil
+		return parseAI(alias, args[2:])
 	case "shell":
 		return Request{Kind: KindShell, Alias: alias}, nil
 	case "threads":
@@ -123,6 +115,38 @@ func Parse(args []string) (Request, error) {
 	default:
 		return Request{}, fmt.Errorf("unknown command %q; use exec, ai, shell, threads, logs, verify, or stop", args[1])
 	}
+}
+
+// parseAI parses: [--ai-cli <cli> | --ai-cli=<cli>] <chat-title> <prompt...>.
+// Without --ai-cli the alias' registered ai cli is used.
+func parseAI(alias string, args []string) (Request, error) {
+	usage := fmt.Errorf("usage: pcode %s ai [--ai-cli cursor|codex|claude|pi] <chat-title> <prompt>", alias)
+	req := Request{Kind: KindAI, Alias: alias}
+	for len(args) > 0 && strings.HasPrefix(args[0], "--ai-cli") {
+		switch {
+		case args[0] == "--ai-cli":
+			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+				return Request{}, fmt.Errorf("pcode %s ai: --ai-cli needs a value", alias)
+			}
+			req.AICLI = args[1]
+			args = args[2:]
+		case strings.HasPrefix(args[0], "--ai-cli="):
+			req.AICLI = strings.TrimPrefix(args[0], "--ai-cli=")
+			args = args[1:]
+		default:
+			return Request{}, usage
+		}
+		if !config.KnownAICLI(req.AICLI) {
+			return Request{}, fmt.Errorf("pcode %s ai: unknown --ai-cli %q (cursor, codex, claude, pi)", alias, req.AICLI)
+		}
+		req.AICLI = config.NormalizeAICLI(req.AICLI)
+	}
+	if len(args) < 2 {
+		return Request{}, usage
+	}
+	req.Title = args[0]
+	req.Prompt = strings.Join(args[1:], " ")
+	return req, nil
 }
 
 func parseAdd(args []string) (Request, error) {
