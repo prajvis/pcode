@@ -74,14 +74,18 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-if [ -f "$plugin_root/VERSION" ]; then
+# bin/VERSION sits next to this script so it is still found when a host
+# mounts only bin/ (Prajvis mounts bin/ and scripts/, not the plugin root).
+if [ -f "$script_dir/VERSION" ]; then
+	version=$(tr -d ' \t\r\n' < "$script_dir/VERSION")
+elif [ -f "$plugin_root/VERSION" ]; then
 	version=$(tr -d ' \t\r\n' < "$plugin_root/VERSION")
 elif [ -f "$plugin_root/plugin.json" ]; then
 	version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$plugin_root/plugin.json" | head -n 1)
 else
-	err "could not read version from VERSION or plugin.json"
+	err "could not read version from bin/VERSION, VERSION or plugin.json"
 fi
-[ -n "$version" ] || err "empty version in VERSION or plugin.json"
+[ -n "$version" ] || err "empty version in bin/VERSION, VERSION or plugin.json"
 version=${version#v}
 
 if [ "$print_version" = 1 ]; then
@@ -146,7 +150,7 @@ src="$extract/pcode"
 
 tmp="$dir/pcode.new.$$"
 cp "$src" "$tmp" || err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
-chmod +x "$tmp"
+chmod 755 "$tmp"
 mv "$tmp" "$dest" || err "$dir is not writable (pass --dir or set PCODE_INSTALL_DIR)"
 
 printf 'installed pcode %s to %s\n' "$version" "$dest"
