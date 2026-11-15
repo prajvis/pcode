@@ -40,6 +40,7 @@ type Request struct {
 	Workspace  string
 	Repo       string
 	AICLI      string
+	Model      string
 	Template   string
 	Org        string
 	Parameters []string
@@ -117,29 +118,47 @@ func Parse(args []string) (Request, error) {
 	}
 }
 
-// parseAI parses: [--ai-cli <cli> | --ai-cli=<cli>] <chat-title> <prompt...>.
-// Without --ai-cli the alias' registered ai cli is used.
+// parseAI parses:
+//
+//	[--ai-cli <cli> | --ai-cli=<cli>] [--model <name> | --model=<name>] <chat-title> <prompt...>
+//
+// The flags may come in either order, before the chat title. Without --ai-cli
+// the alias' registered ai cli is used; without --model the CLI's own default
+// (preset) model is used.
 func parseAI(alias string, args []string) (Request, error) {
-	usage := fmt.Errorf("usage: pcode %s ai [--ai-cli cursor|codex|claude|pi] <chat-title> <prompt>", alias)
+	usage := fmt.Errorf("usage: pcode %s ai [--ai-cli cursor|codex|claude|pi] [--model <name>] <chat-title> <prompt>", alias)
 	req := Request{Kind: KindAI, Alias: alias}
-	for len(args) > 0 && strings.HasPrefix(args[0], "--ai-cli") {
-		switch {
-		case args[0] == "--ai-cli":
-			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
-				return Request{}, fmt.Errorf("pcode %s ai: --ai-cli needs a value", alias)
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		name, value, inline := strings.Cut(args[0], "=")
+		if name != "--ai-cli" && name != "--model" {
+			if name == "--" {
+				args = args[1:]
+				break
 			}
-			req.AICLI = args[1]
-			args = args[2:]
-		case strings.HasPrefix(args[0], "--ai-cli="):
-			req.AICLI = strings.TrimPrefix(args[0], "--ai-cli=")
-			args = args[1:]
-		default:
 			return Request{}, usage
 		}
-		if !config.KnownAICLI(req.AICLI) {
-			return Request{}, fmt.Errorf("pcode %s ai: unknown --ai-cli %q (cursor, codex, claude, pi)", alias, req.AICLI)
+		if inline {
+			args = args[1:]
+		} else {
+			if len(args) < 2 {
+				return Request{}, fmt.Errorf("pcode %s ai: %s needs a value", alias, name)
+			}
+			value = args[1]
+			args = args[2:]
 		}
-		req.AICLI = config.NormalizeAICLI(req.AICLI)
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return Request{}, fmt.Errorf("pcode %s ai: %s needs a value", alias, name)
+		}
+		switch name {
+		case "--ai-cli":
+			if !config.KnownAICLI(value) {
+				return Request{}, fmt.Errorf("pcode %s ai: unknown --ai-cli %q (cursor, codex, claude, pi)", alias, value)
+			}
+			req.AICLI = config.NormalizeAICLI(value)
+		case "--model":
+			req.Model = value
+		}
 	}
 	if len(args) < 2 {
 		return Request{}, usage

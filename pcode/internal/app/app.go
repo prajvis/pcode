@@ -107,7 +107,7 @@ USAGE
   pcode create --help
   pcode version
   pcode <alias> exec <command>
-  pcode <alias> ai [--ai-cli <cli>] <chat-title> <prompt>
+  pcode <alias> ai [--ai-cli <cli>] [--model <name>] <chat-title> <prompt>
   pcode <alias> threads
   pcode <alias> verify
   pcode <alias> logs
@@ -128,11 +128,18 @@ COMMANDS
             the user. Do not use this unless they asked to create a workspace.
   version   Print the pcode version. Also: pcode --version
   exec      Run a command after cd'ing into the alias repo. Also: pcode <alias> x
-  ai        Send a prompt to the alias AI CLI (cursor agent by default;
-            pi runs "pi --mode json --session-id <id>", extra flags such as
-            --model come from CODER_AI_PI_ARGS or Pi's own settings).
+  ai        Send a prompt to the alias AI CLI (cursor agent by default).
             --ai-cli cursor|codex|claude|pi overrides the alias' cli for this
             call only; omit it to use the alias default.
+            --model <name> runs this call on another model. The name goes to
+            the CLI unchanged, so use that CLI's names (cursor: gpt-5.3-codex,
+            pi: fireworks/accounts/fireworks/models/<id>). Omit it to use the
+            preset model (the CLI's configured default).
+            AGENTS: do not switch away from the preset model on your own.
+            Ask the user and get their approval for the specific model
+            before passing --model.
+            Pi chats keep the last model they ran on; pass --model again (or
+            start a new chat-title) to change it back.
             Same alias + same chat-title (+ same cli) resumes the stored
             thread; each cli keeps its own conversation under a chat-title.
             A different title starts a new chat. There is no follow command.
@@ -174,6 +181,7 @@ EXAMPLES
   pcode web ai review "summarize the latest diff"
   pcode web ai review "now fix the comments you just found"
   pcode web ai --ai-cli pi review "second opinion on the same diff"
+  pcode web ai --ai-cli pi --model fireworks/accounts/fireworks/models/kimi-k3 review "..."   (only after the user approved that model)
   pcode web stop review
 `
 }
@@ -338,12 +346,12 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 			}
 		}
 		fmt.Fprintf(a.err(), "sending prompt…\n")
-		if err := a.runCursor(ctx, sess, rec, req.Prompt, resume, title); err != nil {
+		if err := a.runCursor(ctx, sess, rec, req.Prompt, req.Model, resume, title); err != nil {
 			return err
 		}
 		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, resume)
 	case "codex":
-		threadID, err := a.runCodex(ctx, sess, rec, req.Prompt, resume, title)
+		threadID, err := a.runCodex(ctx, sess, rec, req.Prompt, req.Model, resume, title)
 		if err != nil {
 			return err
 		}
@@ -369,19 +377,19 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 			}
 		}
 		fmt.Fprintf(a.err(), "sending prompt…\n")
-		if err := a.runPi(ctx, sess, rec, req.Prompt, resume, title); err != nil {
+		if err := a.runPi(ctx, sess, rec, req.Prompt, req.Model, resume, title); err != nil {
 			return err
 		}
 		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, resume)
 	case "claude":
-		cmd := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.ClaudeCommand + " " + execx.BashQuote(req.Prompt)
+		cmd := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.ClaudeCommand + ModelFlag(req.Model) + " " + execx.BashQuote(req.Prompt)
 		return a.runPlain(ctx, sess, rec.Alias, title, cmd)
 	default:
 		return fmt.Errorf("unsupported ai cli %q (cursor, codex, claude, pi)", cli)
 	}
 }
 
-func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume, title string) error {
+func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.Record, prompt, model, resume, title string) error {
 	flags := "-p"
 	if a.Cfg.CursorStream {
 		flags += " --output-format stream-json --stream-partial-output"
@@ -391,6 +399,7 @@ func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.R
 	if a.Cfg.CursorForce {
 		flags += " --force"
 	}
+	flags += ModelFlag(model)
 	inner := "cd " + execx.BashQuote(rec.Repo) + " && unset CURSOR_AGENT_OUTPUT_FORMAT CURSOR_OUTPUT_FORMAT && " + a.Cfg.CursorCommand + " " + flags
 	if resume != "" {
 		inner += " --resume " + execx.BashQuote(resume)
@@ -468,17 +477,25 @@ func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.R
 	return fmt.Errorf("%w: no result event", render.ErrIncomplete)
 }
 
-// PiCommandLine builds the remote shell command for one Pi run.
-func PiCommandLine(cfg config.Config, repo, prompt, sessionID string) string {
-	inner := "cd " + execx.BashQuote(repo) + " && " + cfg.PiCommand + " --mode json --session-id " + execx.BashQuote(sessionID)
-	if cfg.PiArgs != "" {
-		inner += " " + cfg.PiArgs
+// ModelFlag returns " --model '<name>'" for a non-empty model, else "". Every
+// supported CLI (cursor agent, pi, codex exec, claude) takes --model; the name
+// is passed through unchanged because each CLI has its own model names.
+func ModelFlag(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return ""
 	}
+	return " --model " + execx.BashQuote(model)
+}
+
+// PiCommandLine builds the remote shell command for one Pi run.
+func PiCommandLine(cfg config.Config, repo, prompt, model, sessionID string) string {
+	inner := "cd " + execx.BashQuote(repo) + " && " + cfg.PiCommand + " --mode json --session-id " + execx.BashQuote(sessionID)
+	inner += ModelFlag(model)
 	return inner + " -- " + execx.BashQuote(prompt)
 }
 
-func (a *App) runPi(ctx context.Context, sess remote.Session, rec registry.Record, prompt, sessionID, title string) error {
-	cmd := execx.WrapScript(rec.Alias, title, PiCommandLine(a.Cfg, rec.Repo, prompt, sessionID))
+func (a *App) runPi(ctx context.Context, sess remote.Session, rec registry.Record, prompt, model, sessionID, title string) error {
+	cmd := execx.WrapScript(rec.Alias, title, PiCommandLine(a.Cfg, rec.Repo, prompt, model, sessionID))
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -549,11 +566,12 @@ func (a *App) runPi(ctx context.Context, sess remote.Session, rec registry.Recor
 	return fmt.Errorf("%w: no agent_settled event", render.ErrIncomplete)
 }
 
-func (a *App) runCodex(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume, title string) (string, error) {
+func (a *App) runCodex(ctx context.Context, sess remote.Session, rec registry.Record, prompt, model, resume, title string) (string, error) {
 	flags := "--json"
 	if a.Cfg.CodexForce {
 		flags += " --dangerously-bypass-approvals-and-sandbox"
 	}
+	flags += ModelFlag(model)
 	inner := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.CodexCommand + " exec " + flags
 	if resume != "" {
 		inner += " resume " + execx.BashQuote(resume)

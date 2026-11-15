@@ -183,3 +183,33 @@ func TestParseAICLIOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAIModel(t *testing.T) {
+	for _, args := range [][]string{
+		{"web", "ai", "--model", "kimi", "--ai-cli", "pi", "t", "do", "it"},
+		{"web", "ai", "--ai-cli=pi", "--model=kimi", "t", "do", "it"},
+	} {
+		req, err := Parse(args)
+		if err != nil || req.Model != "kimi" || req.AICLI != "pi" || req.Title != "t" || req.Prompt != "do it" {
+			t.Fatalf("%v: %+v %v", args, req, err)
+		}
+	}
+	req, err := Parse([]string{"web", "ai", "--model", "gpt-5.3-codex", "t", "p"})
+	if err != nil || req.Model != "gpt-5.3-codex" || req.AICLI != "" {
+		t.Fatalf("model without --ai-cli: %+v %v", req, err)
+	}
+	req, err = Parse([]string{"web", "ai", "--", "--model-test", "p"})
+	if err != nil || req.Title != "--model-test" || req.Model != "" {
+		t.Fatalf("-- ends flags: %+v %v", req, err)
+	}
+	for _, bad := range [][]string{
+		{"web", "ai", "--model"},
+		{"web", "ai", "--model=", "t", "p"},
+		{"web", "ai", "--model", "x", "only-title"},
+		{"web", "ai", "--modelx", "t", "p"},
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("expected error for %v", bad)
+		}
+	}
+}

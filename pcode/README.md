@@ -53,6 +53,7 @@ pcode create --alias … --workspace … --template … --parameter 'Name=value'
 pcode <alias> exec '<cmd>'
 pcode <alias> ai <chat-name> '<prompt>'
 pcode <alias> ai --ai-cli pi <chat-name> '<prompt>'   # one-off backend override
+pcode <alias> ai --model <name> <chat-name> '<prompt>'  # one-off model (needs user approval)
 pcode <alias> stop <chat-name>
 pcode <alias> verify
 ```
@@ -61,6 +62,14 @@ Exit codes: 0 completed, 1 pcode/usage/connection error, 2 agent error,
 3 incomplete (no result event), 4 idle timeout, 130 cancelled (signal).
 `pcode <alias> stop <chat-name>` stops a remote ai run. Cancelling the
 local process (SIGINT/SIGTERM/SIGHUP) also stops the remote agent.
+
+## Choosing a model
+
+`--model <name>` on `pcode <alias> ai` passes `--model` to whichever CLI runs
+(cursor agent, pi, codex exec, claude). The name is not translated: use the
+CLI's own names (`agent --list-models`, `pi --list-models`). Without it the
+CLI's preset model is used. Agents must get the user's approval for a
+specific model before switching away from the preset.
 
 ## Pi backend
 
@@ -72,7 +81,7 @@ pcode add --alias web --workspace my-website --repo /home/coder/website --ai-cli
 pcode web ai fix-login 'fix the login redirect and run the tests'
 ```
 
-Each run is `pi --mode json --session-id <uuid> [$CODER_AI_PI_ARGS] -- <prompt>`
+Each run is `pi --mode json --session-id <uuid> [--model <name>] -- <prompt>`
 inside the repo. pcode generates the session id for a new chat name and
 reuses it for follow-ups, so no create-chat step is needed. The JSONL event
 stream is rendered like the other backends: tool calls, assistant text, and
@@ -82,10 +91,10 @@ a final `pi agent completed` / `pi agent failed`. A provider error
 
 Pi must be installed in the workspace (`curl -fsSL https://pi.dev/install.sh | sh`)
 with a provider credential, e.g. a `FIREWORKS_API_KEY` Coder user secret.
-Choose the model in the workspace's `~/.pi/agent/settings.json`
-(`defaultProvider`, `defaultModel`) or locally with
-`CODER_AI_PI_ARGS='--model fireworks/<model-id>'`. `CODER_AI_PI_COMMAND`
-overrides the binary (default `pi`). Pi does not ask before tool calls, so
+The preset model is the workspace's `~/.pi/agent/settings.json`
+(`defaultProvider`, `defaultModel`); `pcode <alias> ai --model <name>` overrides it
+for one call. `CODER_AI_PI_COMMAND` overrides the binary
+(default `pi`). Pi does not ask before tool calls, so
 run it only in workspaces you are fine letting it change.
 
 Registry path resolution is documented in the top-level README and in

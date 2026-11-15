@@ -57,6 +57,14 @@ If you are unsure about a flag, run `pcode --help`. Do not call help on every
 turn. Do not invent wrappers. Do not `coder ssh`. If `pcode` fails, stop and
 report it.
 
+## Backend and model
+
+- `--ai-cli cursor|codex|claude|pi` picks the CLI for one call; omit it to use
+  the alias default. Each CLI keeps its own chat under a chat name.
+- `--model <name>` picks the model for one call, using that CLI's model names.
+  Use the preset model unless the user has approved a specific other model for
+  this work. Ask first; do not switch models on your own.
+
 ## Stop a run
 
 Cancelling the local `pcode <alias> ai` job (Ctrl-C, SIGTERM, SIGHUP, or

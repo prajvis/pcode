@@ -121,9 +121,9 @@ func TestAIPiNoEventsIncomplete(t *testing.T) {
 }
 
 func TestPiCommandLine(t *testing.T) {
-	cfg := config.Config{PiCommand: "pi", PiArgs: "--model fireworks/kimi --approve"}
-	got := PiCommandLine(cfg, "/home/coder/my repo", "it's -x", "abc")
-	want := `cd '/home/coder/my repo' && pi --mode json --session-id 'abc' --model fireworks/kimi --approve -- 'it'"'"'s -x'`
+	cfg := config.Config{PiCommand: "pi"}
+	got := PiCommandLine(cfg, "/home/coder/my repo", "it's -x", "fireworks/kimi", "abc")
+	want := `cd '/home/coder/my repo' && pi --mode json --session-id 'abc' --model 'fireworks/kimi' -- 'it'"'"'s -x'`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
@@ -233,5 +233,63 @@ func TestAICLIOverridePerCall(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "resuming chat fix (") || !strings.Contains(stderr.String(), ", pi)") {
 		t.Fatalf("stderr: %s", stderr.String())
+	}
+}
+
+func TestPiCommandLineNoModel(t *testing.T) {
+	got := PiCommandLine(config.Config{PiCommand: "pi"}, "/r", "hi", "", "abc")
+	if strings.Contains(got, "--model") {
+		t.Fatalf("no --model expected without a model: %s", got)
+	}
+}
+
+// --model reaches every backend's command line, quoted; no --model means no flag.
+func TestAIModelFlagAllCLIs(t *testing.T) {
+	const chatID = "11111111-2222-3333-4444-555555555555"
+	var runs []string
+	sess := &fakeSession{
+		handler: func(command string, stdout, stderr io.Writer) error {
+			switch {
+			case strings.Contains(command, "create-chat"):
+				fmt.Fprintln(stdout, "Created chat "+chatID)
+			case strings.Contains(command, "pi --mode json"):
+				runs = append(runs, command)
+				fmt.Fprintf(stdout, piOKStream, piSessionID(t, command))
+			case strings.Contains(command, "agent -p"):
+				runs = append(runs, command)
+				fmt.Fprintln(stdout, `{"type":"system","model":"test"}`)
+				fmt.Fprintln(stdout, `{"type":"result","result":"ok"}`)
+			case strings.Contains(command, "codex exec"):
+				runs = append(runs, command)
+				fmt.Fprintln(stdout, `{"type":"thread.started","thread_id":"t1"}`)
+				fmt.Fprintln(stdout, `{"type":"turn.completed"}`)
+			case strings.Contains(command, "claude "):
+				runs = append(runs, command)
+			}
+			return nil
+		},
+	}
+	app, _, _ := testApp(t, sess)
+	app.Cfg.PiCommand = "pi"
+	ctx := context.Background()
+	cases := []struct{ cli, model, want string }{
+		{"cursor", "gpt-5.3-codex", `--model '"'"'gpt-5.3-codex'"'"'`},
+		{"pi", "fireworks/accounts/fireworks/models/kimi-k3", `--model '"'"'fireworks/accounts/fireworks/models/kimi-k3'"'"'`},
+		{"codex", "o3", `--model '"'"'o3'"'"'`},
+		{"claude", "opus", `--model '"'"'opus'"'"'`},
+	}
+	for i, c := range cases {
+		if err := app.Run(ctx, []string{"website", "ai", "--model", c.model, "--ai-cli", c.cli, fmt.Sprintf("m%d", i), "hi"}); err != nil {
+			t.Fatalf("%s: %v", c.cli, err)
+		}
+		if last := runs[len(runs)-1]; !strings.Contains(last, c.want) {
+			t.Fatalf("%s: missing %s in %s", c.cli, c.want, last)
+		}
+	}
+	if err := app.Run(ctx, []string{"website", "ai", "--ai-cli=pi", "plain", "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(runs[len(runs)-1], "--model") {
+		t.Fatalf("no --model expected: %s", runs[len(runs)-1])
 	}
 }
