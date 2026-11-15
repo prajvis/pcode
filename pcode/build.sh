@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_BIN="$(cd "${ROOT}/../pcode-plugin" && pwd)/bin"
 export PATH="${HOME}/.local/go/bin:/usr/local/go/bin:${PATH}"
-export GOTOOLCHAIN="${GOTOOLCHAIN:-local}"
+# Default to the go.mod version: newer Go (1.27+) fails to link the tailscale fork Coder needs.
+export GOTOOLCHAIN="${GOTOOLCHAIN:-go$(awk '/^go /{print $2}' "${ROOT}/go.mod")}"
 export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
 
 mkdir -p "${PLUGIN_BIN}"

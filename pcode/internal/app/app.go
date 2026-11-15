@@ -120,7 +120,7 @@ COMMANDS
             --alias       short name, ^[a-z][a-z0-9_-]*$
             --workspace   Coder name or owner/name (e.g. my-app or owner/my-app)
             --repo        absolute repo path inside the workspace
-            --ai-cli      cursor (default), codex, or claude
+            --ai-cli      cursor (default), codex, claude, or pi
   remove    Drop a local alias. Does not delete the Coder workspace.
             Confirm with the user before running this. Also: pcode rm <alias>
   create    Create a Coder workspace from a template, then register the alias.
@@ -128,7 +128,9 @@ COMMANDS
             the user. Do not use this unless they asked to create a workspace.
   version   Print the pcode version. Also: pcode --version
   exec      Run a command after cd'ing into the alias repo. Also: pcode <alias> x
-  ai        Send a prompt to the alias AI CLI (cursor agent by default).
+  ai        Send a prompt to the alias AI CLI (cursor agent by default;
+            pi runs "pi --mode json --session-id <id>", extra flags such as
+            --model come from CODER_AI_PI_ARGS or Pi's own settings).
             Same alias + same chat-title resumes the stored thread.
             A different title starts a new chat. There is no follow command.
   threads   List stored chat titles and thread ids for the alias.
@@ -297,8 +299,14 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 	title := strings.TrimSpace(req.Title)
 	resume := ""
 	if meta, err := a.Threads.Read(rec.Alias, title); err == nil && strings.TrimSpace(meta.ThreadID) != "" {
-		resume = meta.ThreadID
-		fmt.Fprintf(a.err(), "resuming chat %s (%s)\n", title, resume)
+		if stored := config.NormalizeAICLI(meta.AICLI); meta.AICLI != "" && stored != cli {
+			// A thread id from another backend is meaningless here; resuming
+			// it would silently start an empty chat under a foreign id.
+			fmt.Fprintf(a.err(), "chat %s was a %s chat; starting a new %s chat\n", title, stored, cli)
+		} else {
+			resume = meta.ThreadID
+			fmt.Fprintf(a.err(), "resuming chat %s (%s)\n", title, resume)
+		}
 	}
 
 	if err := a.refuseIfRunning(ctx, sess, rec.Alias, title); err != nil {
@@ -339,11 +347,30 @@ func (a *App) ai(ctx context.Context, req parse.Request) error {
 			return fmt.Errorf("codex did not return a thread id")
 		}
 		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, threadID)
+	case "pi":
+		if resume == "" {
+			id, err := NewUUID()
+			if err != nil {
+				return fmt.Errorf("create pi session id: %w", err)
+			}
+			resume = id
+			fmt.Fprintf(a.err(), "creating pi chat %s (%s)…\n", title, resume)
+			// Persist before the run so a retry after a failure continues the
+			// same Pi session (pi --session-id creates it on first use).
+			if err := a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, resume); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintf(a.err(), "sending prompt…\n")
+		if err := a.runPi(ctx, sess, rec, req.Prompt, resume, title); err != nil {
+			return err
+		}
+		return a.Threads.Write(rec.Alias, title, cli, rec.Workspace, rec.Repo, resume)
 	case "claude":
 		cmd := "cd " + execx.BashQuote(rec.Repo) + " && " + a.Cfg.ClaudeCommand + " " + execx.BashQuote(req.Prompt)
 		return a.runPlain(ctx, sess, rec.Alias, title, cmd)
 	default:
-		return fmt.Errorf("unsupported ai cli %q (cursor, codex, claude)", cli)
+		return fmt.Errorf("unsupported ai cli %q (cursor, codex, claude, pi)", cli)
 	}
 }
 
@@ -432,6 +459,87 @@ func (a *App) runCursor(ctx context.Context, sess remote.Session, rec registry.R
 		return runErr
 	}
 	return fmt.Errorf("%w: no result event", render.ErrIncomplete)
+}
+
+// PiCommandLine builds the remote shell command for one Pi run.
+func PiCommandLine(cfg config.Config, repo, prompt, sessionID string) string {
+	inner := "cd " + execx.BashQuote(repo) + " && " + cfg.PiCommand + " --mode json --session-id " + execx.BashQuote(sessionID)
+	if cfg.PiArgs != "" {
+		inner += " " + cfg.PiArgs
+	}
+	return inner + " -- " + execx.BashQuote(prompt)
+}
+
+func (a *App) runPi(ctx context.Context, sess remote.Session, rec registry.Record, prompt, sessionID, title string) error {
+	cmd := execx.WrapScript(rec.Alias, title, PiCommandLine(a.Cfg, rec.Repo, prompt, sessionID))
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := sess.RunWithStdin(runCtx, cmd, stdinR, pw, a.err())
+		_ = pw.CloseWithError(err)
+		errCh <- err
+	}()
+
+	dec := &render.PiDecoder{}
+	src := io.Reader(pr)
+	copyErrCh := make(chan error, 1)
+	if a.Cfg.IdleTimeout > 0 {
+		ipr, ipw := io.Pipe()
+		go func() {
+			err := execx.CopyIdleBusy(runCtx, pr, ipw, a.Cfg.IdleTimeout, dec.Busy)
+			_ = ipw.CloseWithError(err)
+			copyErrCh <- err
+		}()
+		src = ipr
+	} else {
+		copyErrCh <- nil
+	}
+	resultCh := make(chan struct{})
+	var resultOnce sync.Once
+	dec.OnComplete = func() { resultOnce.Do(func() { close(resultCh) }) }
+	stopGrace := a.startStreamGrace(resultCh, cancel, stdinW, pr, pw)
+	res := dec.Render(src, a.out())
+	stopGrace()
+	copyErr := <-copyErrCh
+
+	idle := errors.Is(copyErr, execx.ErrIdleTimeout)
+	parentCancel := ctx.Err() != nil
+	if idle || parentCancel || res.Err != nil || !res.Completed {
+		cancel()
+		_ = stdinW.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		a.killRemote(sess, rec.Alias, title)
+	}
+	runErr := waitErr(errCh, 8*time.Second)
+	if runErr != nil && strings.Contains(runErr.Error(), "timed out waiting") {
+		cancel()
+		_ = stdinW.Close()
+		_ = pr.Close()
+		_ = pw.Close()
+		a.killRemote(sess, rec.Alias, title)
+	}
+	if idle {
+		return fmt.Errorf("%w after %s", execx.ErrIdleTimeout, a.Cfg.IdleTimeout)
+	}
+	if parentCancel {
+		return ctx.Err()
+	}
+	if res.Err != nil {
+		return res.Err
+	}
+	if res.Completed {
+		return nil
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return fmt.Errorf("%w: no agent_settled event", render.ErrIncomplete)
 }
 
 func (a *App) runCodex(ctx context.Context, sess remote.Session, rec registry.Record, prompt, resume, title string) (string, error) {

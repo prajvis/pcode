@@ -27,6 +27,8 @@ type Config struct {
 	CursorCommand    string
 	CodexCommand     string
 	ClaudeCommand    string
+	PiCommand        string
+	PiArgs           string
 	StartTimeout     time.Duration
 	StartPoll        time.Duration
 	SSHReadyAttempts int
@@ -65,6 +67,8 @@ func Load() Config {
 		CursorCommand:    firstNonEmpty(os.Getenv("CODER_AI_CURSOR_COMMAND"), "agent"),
 		CodexCommand:     firstNonEmpty(os.Getenv("CODER_AI_CODEX_COMMAND"), "codex"),
 		ClaudeCommand:    firstNonEmpty(os.Getenv("CODER_AI_CLAUDE_COMMAND"), "claude"),
+		PiCommand:        firstNonEmpty(os.Getenv("CODER_AI_PI_COMMAND"), "pi"),
+		PiArgs:           strings.TrimSpace(os.Getenv("CODER_AI_PI_ARGS")),
 		StartTimeout:     durationSecs("CODER_WORKSPACE_START_TIMEOUT_SECS", 300),
 		StartPoll:        durationSecs("CODER_WORKSPACE_START_POLL_SECS", 3),
 		SSHReadyAttempts: intEnv("CODER_SSH_READY_ATTEMPTS", 3),
@@ -113,6 +117,8 @@ func NormalizeAICLI(cli string) string {
 		return "claude"
 	case "codex":
 		return "codex"
+	case "pi", "pi-agent", "pi-coding-agent":
+		return "pi"
 	default:
 		return cli
 	}
@@ -120,7 +126,7 @@ func NormalizeAICLI(cli string) string {
 
 func ThreadBacked(cli string) bool {
 	switch NormalizeAICLI(cli) {
-	case "cursor", "codex":
+	case "cursor", "codex", "pi":
 		return true
 	default:
 		return false
